@@ -1,27 +1,9 @@
+# Depot Power Planner
+# Copyright (c) 2026 Maria Xylia and Stockholm Environment Institute
+# Licensed under the MIT License.
+
 # ==========================================================
 # Depot Power Planner
-# ==========================================================
-# This tool compares two charging approaches for an electric
-# bus depot:
-#
-# 1. Fixed charging sessions
-#    - The charging window is split into fixed-length sessions
-#    - Each bus is assigned to exactly ONE session
-#    - A bus cannot continue charging in later sessions
-#    - Priority buses are assigned to the earliest possible
-#      session after they arrive
-#
-# 2. Flexible smart charging
-#    - Priority buses start charging immediately when they arrive
-#    - The remaining fleet is then charged as flexibly as possible
-#      across the remaining charging window
-#
-# This version includes:
-# - Priority charging with a separate arrival time
-# - Constant depot baseload (kW)
-# - Capacity check against a known depot power limit
-# - 24-hour load curve with charging load + total depot load
-# - CSV and PDF export
 # ==========================================================
 
 from dataclasses import dataclass
@@ -119,8 +101,8 @@ class DepotInputs:
     efficiency: float
     min_soc: float
     target_soc: float
-    charging_strategy: str  # "fixed_sessions" or "smart_charging"
-    mode: str  # "estimate_capacity" or "check_known_limit"
+    charging_strategy: str
+    mode: str
     grid_cap_kw: Optional[float]
 
 
@@ -165,7 +147,9 @@ def build_time_context(
         charging_end_dt += timedelta(days=1)
 
     if enable_priority:
-        priority_arrival_dt = resolve_time(general_arrival_dt, priority_arrival_time, spans_midnight)
+        priority_arrival_dt = resolve_time(
+            general_arrival_dt, priority_arrival_time, spans_midnight
+        )
     else:
         priority_arrival_dt = general_arrival_dt
 
@@ -226,12 +210,12 @@ def build_step_series(
 ):
     """
     Build exact stepwise x/y series from intervals.
-    Each interval is {"start": dt, "end": dt, "charging_kw": value}.
 
-    Important:
-    - If two intervals are back-to-back, do NOT force a drop to base
-      in between. That avoids the artificial sharp drop/rise seen in
-      smart charging after the priority block.
+    Each interval is:
+    {"start": datetime, "end": datetime, "charging_kw": value}
+
+    If two intervals are back-to-back, the function does not force
+    an artificial drop to baseload between them.
     """
     clipped = []
     for item in intervals:
@@ -267,9 +251,7 @@ def build_step_series(
         current_time = e
         current_load = target_load
 
-        next_starts_now = (
-            i < len(clipped) - 1 and clipped[i + 1]["start"] == e
-        )
+        next_starts_now = i < len(clipped) - 1 and clipped[i + 1]["start"] == e
 
         if not next_starts_now:
             if current_load != base_kw:
@@ -279,7 +261,7 @@ def build_step_series(
 
     if current_time < display_end:
         x.append(display_end)
-        y.append(current_load if current_load is not None else base_kw)
+        y.append(current_load)
 
     return x, y
 
@@ -459,6 +441,7 @@ def create_summary_pdf(
         ("Battery level when buses return", inputs.min_soc),
         ("Battery level before buses leave", inputs.target_soc),
     ]
+
     y = draw_key_value_section(c, "Inputs", inputs_items, x_left, y, page_width, page_height, bottom_margin)
 
     main_items = list(zip(main_results_df["Metric"], main_results_df["Value"]))
@@ -518,20 +501,14 @@ def run_fixed_sessions(inputs: DepotInputs):
         raise ValueError("Priority 12 m buses cannot exceed total 12 m buses.")
     if inputs.priority_18m > inputs.n_18m:
         raise ValueError("Priority 18 m buses cannot exceed total 18 m buses.")
-    if not inputs.enable_priority:
-        priority_12m = 0
-        priority_18m = 0
-    else:
-        priority_12m = inputs.priority_12m
-        priority_18m = inputs.priority_18m
+
+    priority_12m = inputs.priority_12m if inputs.enable_priority else 0
+    priority_18m = inputs.priority_18m if inputs.enable_priority else 0
 
     soc_fraction = max(0.0, inputs.target_soc - inputs.min_soc)
 
-    e_12m_battery_kwh = soc_fraction * inputs.battery_12m_kwh
-    e_18m_battery_kwh = soc_fraction * inputs.battery_18m_kwh
-
-    e_12m_grid_kwh = e_12m_battery_kwh / inputs.efficiency
-    e_18m_grid_kwh = e_18m_battery_kwh / inputs.efficiency
+    e_12m_grid_kwh = soc_fraction * inputs.battery_12m_kwh / inputs.efficiency
+    e_18m_grid_kwh = soc_fraction * inputs.battery_18m_kwh / inputs.efficiency
 
     p_12m_required_kw = e_12m_grid_kwh / inputs.session_length_h
     p_18m_required_kw = e_18m_grid_kwh / inputs.session_length_h
@@ -563,7 +540,6 @@ def run_fixed_sessions(inputs: DepotInputs):
     session_18m = [0] * n_sessions
     session_12m_priority = [0] * n_sessions
     session_18m_priority = [0] * n_sessions
-
     reserved_priority_sessions = set()
 
     if inputs.enable_priority and (priority_12m + priority_18m) > 0:
@@ -596,6 +572,7 @@ def run_fixed_sessions(inputs: DepotInputs):
 
     session_rows = []
     intervals = []
+
     for i in range(n_sessions):
         n12 = session_12m[i]
         n18 = session_18m[i]
@@ -653,20 +630,14 @@ def run_fixed_sessions(inputs: DepotInputs):
         capacity_gap_kw = 0.0
         feasible_against_cap = True
 
-    status_category = get_status_category(
-        inputs.mode, capacity_gap_kw, total_peak_kw, available_limit_kw
-    )
+    status_category = get_status_category(inputs.mode, capacity_gap_kw, total_peak_kw, available_limit_kw)
 
     total_grid_energy_kwh = inputs.n_12m * e_12m_grid_kwh + inputs.n_18m * e_18m_grid_kwh
     total_depot_energy_kwh = total_grid_energy_kwh + inputs.baseload_kw * total_window_h
 
     summary = {
         "Charging strategy": "Fixed charging sessions",
-        "Mode": (
-            "Estimate minimum depot capacity"
-            if inputs.mode == "estimate_capacity"
-            else "Check against known depot power limit"
-        ),
+        "Mode": "Estimate minimum depot capacity" if inputs.mode == "estimate_capacity" else "Check against known depot power limit",
         "Number of sessions": n_sessions,
         "Session length (h)": inputs.session_length_h,
         "Total charging horizon (h)": round(total_window_h, 2),
@@ -736,12 +707,9 @@ def run_smart_charging(inputs: DepotInputs):
         raise ValueError("Priority 12 m buses cannot exceed total 12 m buses.")
     if inputs.priority_18m > inputs.n_18m:
         raise ValueError("Priority 18 m buses cannot exceed total 18 m buses.")
-    if not inputs.enable_priority:
-        priority_12m = 0
-        priority_18m = 0
-    else:
-        priority_12m = inputs.priority_12m
-        priority_18m = inputs.priority_18m
+
+    priority_12m = inputs.priority_12m if inputs.enable_priority else 0
+    priority_18m = inputs.priority_18m if inputs.enable_priority else 0
 
     total_buses = inputs.n_12m + inputs.n_18m
     if total_buses == 0:
@@ -749,11 +717,8 @@ def run_smart_charging(inputs: DepotInputs):
 
     soc_fraction = max(0.0, inputs.target_soc - inputs.min_soc)
 
-    e_12m_battery_kwh = soc_fraction * inputs.battery_12m_kwh
-    e_18m_battery_kwh = soc_fraction * inputs.battery_18m_kwh
-
-    e_12m_grid_kwh = e_12m_battery_kwh / inputs.efficiency
-    e_18m_grid_kwh = e_18m_battery_kwh / inputs.efficiency
+    e_12m_grid_kwh = soc_fraction * inputs.battery_12m_kwh / inputs.efficiency
+    e_18m_grid_kwh = soc_fraction * inputs.battery_18m_kwh / inputs.efficiency
 
     priority_energy_kwh = priority_12m * e_12m_grid_kwh + priority_18m * e_18m_grid_kwh
     priority_bus_count = priority_12m + priority_18m
@@ -764,7 +729,7 @@ def run_smart_charging(inputs: DepotInputs):
 
     if priority_bus_count > 0:
         priority_charging_power_kw = priority_bus_count * inputs.charger_power_kw
-        priority_duration_h = priority_energy_kwh / priority_charging_power_kw if priority_charging_power_kw > 0 else 0.0
+        priority_duration_h = priority_energy_kwh / priority_charging_power_kw
     else:
         priority_charging_power_kw = 0.0
         priority_duration_h = 0.0
@@ -778,9 +743,7 @@ def run_smart_charging(inputs: DepotInputs):
         raise ValueError("Priority buses alone cannot be fully charged within the charging horizon.")
 
     if remaining_energy_kwh > 1e-9 and remaining_window_h <= 1e-9:
-        raise ValueError(
-            "No time remains for the non-priority buses after charging the priority buses first."
-        )
+        raise ValueError("No time remains for the non-priority buses after charging the priority buses first.")
 
     remaining_required_kw = remaining_energy_kwh / remaining_window_h if remaining_window_h > 0 else 0.0
     charging_peak_kw = max(priority_charging_power_kw, remaining_required_kw)
@@ -808,9 +771,7 @@ def run_smart_charging(inputs: DepotInputs):
         capacity_gap_kw = 0.0
         feasible_against_cap = True
 
-    status_category = get_status_category(
-        inputs.mode, capacity_gap_kw, total_peak_kw, available_limit_kw
-    )
+    status_category = get_status_category(inputs.mode, capacity_gap_kw, total_peak_kw, available_limit_kw)
 
     block_rows = []
     intervals = []
@@ -833,11 +794,7 @@ def run_smart_charging(inputs: DepotInputs):
             }
         )
         intervals.append(
-            {
-                "start": priority_arrival_dt,
-                "end": priority_finish_dt,
-                "charging_kw": priority_charging_power_kw,
-            }
+            {"start": priority_arrival_dt, "end": priority_finish_dt, "charging_kw": priority_charging_power_kw}
         )
 
     if remaining_energy_kwh > 1e-9 and remaining_window_h > 1e-9:
@@ -858,11 +815,7 @@ def run_smart_charging(inputs: DepotInputs):
             }
         )
         intervals.append(
-            {
-                "start": remaining_start_dt,
-                "end": charging_end_dt,
-                "charging_kw": remaining_required_kw,
-            }
+            {"start": remaining_start_dt, "end": charging_end_dt, "charging_kw": remaining_required_kw}
         )
 
     smart_df = pd.DataFrame(block_rows)
@@ -872,11 +825,7 @@ def run_smart_charging(inputs: DepotInputs):
 
     summary = {
         "Charging strategy": "Flexible smart charging",
-        "Mode": (
-            "Estimate minimum depot capacity"
-            if inputs.mode == "estimate_capacity"
-            else "Check against known depot power limit"
-        ),
+        "Mode": "Estimate minimum depot capacity" if inputs.mode == "estimate_capacity" else "Check against known depot power limit",
         "Total charging horizon (h)": round(total_window_h, 2),
         "Priority charging time used (h)": round(priority_duration_h, 2),
         "Remaining flexible charging time (h)": round(max(remaining_window_h, 0.0), 2),
@@ -937,22 +886,35 @@ def run_model(inputs: DepotInputs):
 # ==========================================================
 # STREAMLIT UI
 # ==========================================================
-st.title("Depot Power Planner")
+col_logo, col_title = st.columns([1, 4])
+
+with col_logo:
+    try:
+        st.image("SEI-Master-Logo-Extended-Black-RGB.jpg", width=180)
+    except Exception:
+        st.caption("SEI")
+
+with col_title:
+    st.title("Depot Power Planner")
+    st.caption(
+        "A planning tool for estimating charging power requirements for battery-electric bus depots."
+    )
+
+st.info("Beta version – feedback is welcome and will help improve future releases.")
+
 st.caption(
-    "Quick guide: fill in the inputs in the left panel. "
-    "The tool estimates depot power needs for the selected fleet, shows whether the depot limit is sufficient, "
-    "displays the 24-hour charging profile, and summarizes how buses are allocated across sessions or charging blocks."
+    "Getting started: fill in the fleet and depot inputs in the left panel. "
+    "The tool estimates required depot power, visualizes the 24-hour load profile, "
+    "and summarizes fixed charging sessions or flexible smart charging blocks."
 )
+
 
 with st.sidebar:
     st.header("Inputs")
 
     charging_strategy_display = st.radio(
         "Charging approach",
-        options=[
-            "Fixed charging sessions",
-            "Flexible smart charging",
-        ],
+        options=["Fixed charging sessions", "Flexible smart charging"],
         index=0,
     )
     charging_strategy = (
@@ -963,36 +925,15 @@ with st.sidebar:
 
     mode_display = st.radio(
         "What do you want the tool to do?",
-        options=[
-            "Estimate minimum depot capacity",
-            "Check against a known depot power limit",
-        ],
+        options=["Estimate minimum depot capacity", "Check against a known depot power limit"],
         index=0,
     )
-    mode = (
-        "estimate_capacity"
-        if mode_display == "Estimate minimum depot capacity"
-        else "check_known_limit"
-    )
+    mode = "estimate_capacity" if mode_display == "Estimate minimum depot capacity" else "check_known_limit"
 
     st.subheader("Fleet")
 
-    n_12m = st.number_input(
-        "Number of 12 m buses",
-        min_value=0,
-        max_value=1000,
-        value=20,
-        step=1,
-        help="How many 12-meter buses are in the fleet.",
-    )
-    n_18m = st.number_input(
-        "Number of 18 m buses",
-        min_value=0,
-        max_value=1000,
-        value=10,
-        step=1,
-        help="How many 18-meter buses are in the fleet.",
-    )
+    n_12m = st.number_input("Number of 12 m buses", min_value=0, max_value=1000, value=20, step=1)
+    n_18m = st.number_input("Number of 18 m buses", min_value=0, max_value=1000, value=10, step=1)
 
     st.subheader("Priority charging")
 
@@ -1003,27 +944,9 @@ with st.sidebar:
     )
 
     if enable_priority:
-        priority_12m = st.number_input(
-            "Priority 12 m buses",
-            min_value=0,
-            max_value=1000,
-            value=0,
-            step=1,
-            help="These 12 m buses are assumed to need charging before the rest of the fleet.",
-        )
-        priority_18m = st.number_input(
-            "Priority 18 m buses",
-            min_value=0,
-            max_value=1000,
-            value=0,
-            step=1,
-            help="These 18 m buses are assumed to need charging before the rest of the fleet.",
-        )
-        priority_arrival_time = st.text_input(
-            "Priority bus arrival time (HH:MM)",
-            "23:00",
-            help="Time when the priority buses arrive at the depot.",
-        )
+        priority_12m = st.number_input("Priority 12 m buses", min_value=0, max_value=1000, value=0, step=1)
+        priority_18m = st.number_input("Priority 18 m buses", min_value=0, max_value=1000, value=0, step=1)
+        priority_arrival_time = st.text_input("Priority bus arrival time (HH:MM)", "23:00")
     else:
         priority_12m = 0
         priority_18m = 0
@@ -1031,31 +954,10 @@ with st.sidebar:
 
     st.subheader("Vehicle and depot assumptions")
 
-    battery_12m = st.number_input(
-        "Battery size of 12 m bus (kWh)",
-        min_value=100.0,
-        max_value=2000.0,
-        value=350.0,
-        step=10.0,
-        help="Typical battery size for a 12-meter bus.",
-    )
-    battery_18m = st.number_input(
-        "Battery size of 18 m bus (kWh)",
-        min_value=100.0,
-        max_value=2000.0,
-        value=500.0,
-        step=10.0,
-        help="Typical battery size for an 18-meter bus.",
-    )
+    battery_12m = st.number_input("Battery size of 12 m bus (kWh)", min_value=100.0, max_value=2000.0, value=350.0, step=10.0)
+    battery_18m = st.number_input("Battery size of 18 m bus (kWh)", min_value=100.0, max_value=2000.0, value=500.0, step=10.0)
 
-    charger_power_kw = st.number_input(
-        "Charger power per bus (kW)",
-        min_value=10.0,
-        max_value=1000.0,
-        value=150.0,
-        step=10.0,
-        help="Maximum charging power available to each bus.",
-    )
+    charger_power_kw = st.number_input("Charger power per bus (kW)", min_value=10.0, max_value=1000.0, value=150.0, step=10.0)
 
     baseload_kw = st.number_input(
         "Depot baseload (kW)",
@@ -1067,66 +969,25 @@ with st.sidebar:
     )
 
     if mode == "check_known_limit":
-        grid_cap_kw = st.number_input(
-            "Depot power limit (kW)",
-            min_value=100.0,
-            max_value=20000.0,
-            value=1800.0,
-            step=50.0,
-            help="The maximum depot power available from the grid connection.",
-        )
+        grid_cap_kw = st.number_input("Depot power limit (kW)", min_value=100.0, max_value=20000.0, value=1800.0, step=50.0)
     else:
         grid_cap_kw = None
 
     st.subheader("Time assumptions")
 
-    general_arrival_time = st.text_input(
-        "General fleet arrival time (HH:MM)",
-        "23:00",
-        help="Time when the main fleet arrives at the depot.",
-    )
-    charging_end_time = st.text_input(
-        "Charging end time (HH:MM)",
-        "05:00",
-        help="Time by which charging must be completed.",
-    )
+    general_arrival_time = st.text_input("General fleet arrival time (HH:MM)", "23:00")
+    charging_end_time = st.text_input("Charging end time (HH:MM)", "05:00")
 
     if charging_strategy == "fixed_sessions":
-        session_length_h = st.number_input(
-            "Fixed session length (hours)",
-            min_value=0.5,
-            max_value=12.0,
-            value=3.0,
-            step=0.5,
-            help="Length of each charging session. Each bus must finish within one session.",
-        )
+        session_length_h = st.number_input("Fixed session length (hours)", min_value=0.5, max_value=12.0, value=3.0, step=0.5)
     else:
         session_length_h = 3.0
 
     st.subheader("Charging assumptions")
 
-    efficiency = st.slider(
-        "Charging efficiency",
-        min_value=0.70,
-        max_value=1.00,
-        value=0.92,
-        step=0.01,
-        help="Includes charging losses. Typical values are around 0.90 to 0.95.",
-    )
-    min_soc = st.slider(
-        "Battery level when buses return",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.2,
-        step=0.05,
-    )
-    target_soc = st.slider(
-        "Battery level before buses leave",
-        min_value=0.0,
-        max_value=1.0,
-        value=1.0,
-        step=0.05,
-    )
+    efficiency = st.slider("Charging efficiency", min_value=0.70, max_value=1.00, value=0.92, step=0.01)
+    min_soc = st.slider("Battery level when buses return", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
+    target_soc = st.slider("Battery level before buses leave", min_value=0.0, max_value=1.0, value=1.0, step=0.05)
 
     timestep_min = st.selectbox(
         "Timestep for chart (minutes)",
@@ -1134,6 +995,7 @@ with st.sidebar:
         index=2,
         help="Only affects how smooth the chart looks.",
     )
+
 
 inputs = DepotInputs(
     n_12m=n_12m,
@@ -1157,6 +1019,7 @@ inputs = DepotInputs(
     mode=mode,
     grid_cap_kw=grid_cap_kw,
 )
+
 
 # ==========================================================
 # RUN MODEL
@@ -1375,10 +1238,7 @@ try:
             ),
         )
 
-        fig.update_xaxes(
-            tickformat="%H:%M",
-            type="date",
-        )
+        fig.update_xaxes(tickformat="%H:%M", type="date")
 
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1451,7 +1311,11 @@ try:
 
     with download_col1:
         csv_bytes = display_table_df.to_csv(index=False).encode("utf-8")
-        csv_name = "depot_power_planner_sessions.csv" if charging_strategy == "fixed_sessions" else "depot_power_planner_smart_charging_blocks.csv"
+        csv_name = (
+            "depot_power_planner_sessions.csv"
+            if charging_strategy == "fixed_sessions"
+            else "depot_power_planner_smart_charging_blocks.csv"
+        )
         st.download_button(
             "Download table CSV",
             data=csv_bytes,
@@ -1474,6 +1338,38 @@ try:
             file_name="depot_power_planner_summary.pdf",
             mime="application/pdf",
         )
+
+    with st.expander("About, funding, feedback and attribution"):
+        st.markdown("""
+### Depot Power Planner
+
+**Depot Power Planner** is a simple planning tool for estimating charging power requirements for battery-electric bus depots. It is intended to support first-order planning and exploration of different charging strategies rather than detailed depot design.
+
+**Developed by**  
+Maria Xylia  
+Stockholm Environment Institute (SEI)
+
+**Funding**  
+This tool was developed within the **ResPT project**, funded by the **Swedish Energy Agency (Energimyndigheten)**.
+
+**Version**  
+Beta version (2026)
+
+**License**  
+Released under the **MIT License**.
+
+**Feedback**  
+This tool is currently in active development. Feedback is welcome on usability, assumptions, missing functionality, bugs, and ideas for future improvements.
+
+Please send comments and suggestions to: **maria.xylia@sei.org**
+
+**Suggested citation**  
+Xylia, M. (2026). *Depot Power Planner*. Stockholm Environment Institute (SEI).  
+DOI to be added in a future release.
+
+**Disclaimer**  
+This tool provides first-order planning estimates based on simplified charging assumptions. It is intended to support early-stage planning and should not replace detailed depot design or operational simulation.
+""")
 
     st.info(
         "How this tool works:\n"
